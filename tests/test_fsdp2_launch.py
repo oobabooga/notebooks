@@ -423,6 +423,38 @@ _LAUNCHER_STUB = textwrap.dedent('''\
 ''')
 
 
+def _fake_pip_env(tmp_path, log):
+    """Env for observing installs without installing anything: a ``pip`` package and an
+    ``unsloth`` console script on PYTHONPATH (what this interpreter runs) that record
+    their arguments, and a ``pip`` / ``python`` / ``unsloth`` first on PATH that belong to
+    no environment and must never run."""
+    fake = tmp_path / "fake_pip"
+    (fake / "pip").mkdir(parents = True)
+    (fake / "pip" / "__init__.py").write_text("")
+    (fake / "pip" / "__main__.py").write_text(
+        "import sys\n"
+        f"with open({str(log)!r}, 'a') as f:\n"
+        "    f.write('pip-ran ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+    )
+    (fake / "fake_unsloth_cli.py").write_text(
+        "import sys\n"
+        "def main():\n"
+        f"    with open({str(log)!r}, 'a') as f:\n"
+        "        f.write(sys.argv[0] + '-ran ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+    )
+    info = fake / "fake_unsloth_cli-1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: fake-unsloth-cli\nVersion: 1.0\n")
+    (info / "entry_points.txt").write_text("[console_scripts]\nunsloth = fake_unsloth_cli:main\n")
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    for tool in ("pip", "pip3", "python", "python3", "unsloth"):
+        (decoy / tool).write_text(f'#!/bin/bash\necho "path-{tool}-ran $*" >> {shlex.quote(str(log))}\n')
+        (decoy / tool).chmod(0o755)
+    pythonpath = os.pathsep.join(filter(None, [str(fake), os.environ.get("PYTHONPATH", "")]))
+    return {"PYTHONPATH": pythonpath, "decoy": str(decoy)}
+
+
 def _torchrun_case(tmp_path, extra_env):
     root = tmp_path / "repo"
     (root / "python_scripts").mkdir(parents = True)
@@ -431,21 +463,22 @@ def _torchrun_case(tmp_path, extra_env):
     (root / "fsdp2_scripts" / "unsloth_fsdp2_launch.py").write_text(LAUNCH_PATH.read_text())
     launcher = root / "fsdp2_scripts" / SCRIPT_NAME
     launcher.write_text(_LAUNCHER_STUB.format(name = SCRIPT_NAME))
-    # A `pip` / `uv` on PATH that only records it was called, so "installs" are
-    # observable without installing anything.
+    # "Installs" are observable without installing anything: `pip` reaches a fake pip
+    # module through this interpreter, and `uv` on PATH only records it was called.
     shim = tmp_path / "shim"
     shim.mkdir()
-    for tool in ("pip", "uv"):
-        (shim / tool).write_text(f'#!/bin/bash\necho "{tool}-ran $*" >> "$FAKE_LOG"\n')
-        (shim / tool).chmod(0o755)
+    (shim / "uv").write_text('#!/bin/bash\necho "uv-ran $*" >> "$FAKE_LOG"\n')
+    (shim / "uv").chmod(0o755)
     work, out, tmpdir = tmp_path / "work", tmp_path / "out", tmp_path / "tmp"
     for d in (work, out, tmpdir):
         d.mkdir()
     log = tmp_path / "shell.log"
     log.touch()
+    fake = _fake_pip_env(tmp_path, log)
     env = _clean_env()
     env.update(
-        PATH = f"{shim}{os.pathsep}{env.get('PATH', '')}",
+        PATH = f"{fake['decoy']}{os.pathsep}{shim}{os.pathsep}{env.get('PATH', '')}",
+        PYTHONPATH = fake["PYTHONPATH"],
         FAKE_LOG = str(log), FAKE_OUT = str(out), TMPDIR = str(tmpdir),
     )
     env.update(extra_env)
@@ -473,6 +506,7 @@ def test_real_torchrun_two_ranks_on_cpu(tmp_path):
     # package is already installed is skipped with a note naming the command.
     assert log.count("pip-ran install fake-pkg-xyz") == 1
     assert log.count("uv-ran pip install --system fake-pkg-abc") == 1
+    assert not any(line.startswith("path-") for line in log)
     assert not any("pytest" in line for line in log)
     assert "skipped install step (already installed: pytest): pip install -q --upgrade pytest" in result.stderr
     assert "UNSLOTH_FSDP2_RUN_INSTALLS=1" in result.stderr
@@ -541,6 +575,16 @@ def installed(fl, tmp_path, monkeypatch):
     bin_dir.mkdir()
     monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setattr(fl, "_dpkg_installed", lambda package: False)
+    # Only the fake site counts, and the test interpreter counts as a virtual environment
+    # (which the shell steps name to uv through VIRTUAL_ENV), whatever runs the tests.
+    monkeypatch.setattr(fl, "_in_venv", lambda: True)
+    for name in ("UV_PYTHON", "UV_SYSTEM_PYTHON", *fl._PIP_ENV_REDIRECTS):
+        monkeypatch.delenv(name, raising = False)
+    import importlib.metadata
+    monkeypatch.setattr(fl, "_installed_versions", lambda: {
+        fl._normalize(dist.metadata["Name"]): dist.version
+        for dist in importlib.metadata.distributions(path = [str(site)])
+    })
 
     def add_dist(name, version = "1.0"):
         _fake_dist(site, name, version)
@@ -610,8 +654,8 @@ def test_apt_and_ollama_run_only_when_the_program_is_missing(fl, installed):
 @pytest.mark.parametrize("command, skip", [
     ("pip install --upgrade -qqq langid", True),
     ("python -m pip install -qU langid --root-user-action=ignore", True),
-    ("uv pip install --system -qqq 'langid==1.1.6'", True),
-    ("uv pip install --system -qqq 'langid>=2'", False),
+    ("uv pip install -qqq 'langid==1.1.6'", True),
+    ("uv pip install -qqq 'langid>=2'", False),
     ("pip install --no-deps --force-reinstall langid unsloth_zoo", True),
     ("pip install langid other-missing-pkg", False),
     ("pip install --no-deps git+https://github.com/unslothai/unsloth-zoo.git", True),
@@ -641,13 +685,144 @@ def test_non_install_commands_have_no_decision(fl):
 
 
 def _shim_pip(tmp_path, monkeypatch):
-    shim = tmp_path / "shim"
-    shim.mkdir()
     log = tmp_path / "pip.log"
-    (shim / "pip").write_text(f'#!/bin/bash\necho "pip-ran $*" >> {shlex.quote(str(log))}\n')
-    (shim / "pip").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+    fake = _fake_pip_env(tmp_path, log)
+    monkeypatch.setenv("PYTHONPATH", fake["PYTHONPATH"])
+    monkeypatch.setenv("PATH", f"{fake['decoy']}{os.pathsep}{os.environ['PATH']}")
     return log
+
+
+def test_shell_steps_use_this_interpreter_not_path(fl, tmp_path, monkeypatch):
+    """The install check reads this interpreter's packages, so pip / python in a shell
+    step must be this interpreter, not the first ones on PATH."""
+    log = _shim_pip(tmp_path, monkeypatch)
+    shell = fl.FSDP2Shell()
+    shell._system("pip install never-installed-pkg-xyz")
+    shell._system("pip3 install never-installed-pkg-abc")
+    shell._system("python -m pip install never-installed-pkg-def")
+    shell._system("unsloth install-kernels never-installed-kernel-xyz")
+    out = shell.getoutput("python -c 'import sys; print(sys.executable)'; python3 -c 'print(1)'")
+    ran = log.read_text()
+    assert "pip-ran install never-installed-pkg-xyz" in ran
+    assert "pip-ran install never-installed-pkg-abc" in ran
+    assert "pip-ran install never-installed-pkg-def" in ran
+    # install-kernels installs into the interpreter its command runs on.
+    assert "unsloth-ran install-kernels never-installed-kernel-xyz" in ran
+    assert "path-" not in ran
+    assert out == [sys.executable, "1"]
+    # A bash started by the step sees the same functions.
+    assert shell.getoutput("bash -c 'type -t pip python'") == ["function", "function"]
+
+
+@pytest.mark.parametrize("in_venv", [True, False])
+def test_virtual_env_names_this_interpreter_for_uv(fl, monkeypatch, in_venv):
+    monkeypatch.setenv("VIRTUAL_ENV", "/some/other/venv")
+    monkeypatch.setattr(sys, "prefix", "/this/venv")
+    monkeypatch.setattr(sys, "base_prefix", "/usr" if in_venv else "/this/venv")
+    env = fl._shell_env()
+    assert env["UNSLOTH_FSDP2_PYTHON"] == sys.executable
+    assert env["VIRTUAL_ENV"] == ("/this/venv" if in_venv else "/some/other/venv")
+
+
+@pytest.mark.parametrize("command, variable, value", [
+    ("uv pip install langid", "UV_PYTHON", "/other/env/bin/python"),
+    ("uv pip install langid", "UV_PYTHON", "3.12"),
+    ("pip install langid", "PIP_TARGET", "/other/site"),
+    ("pip install langid", "PIP_PREFIX", "/other"),
+    ("pip install langid", "PIP_ROOT", "/other"),
+    ("pip install langid", "PIP_PYTHON", "/other/env/bin/python"),
+    ("python -m pip uninstall -y missing-pkg", "PIP_TARGET", "/other/site"),
+    ("unsloth install-kernels langid", "PIP_TARGET", "/other/site"),
+])
+def test_inherited_redirection_always_runs(fl, installed, monkeypatch, command, variable, value):
+    """The variable forms of --python / --target / --prefix / --root: the install goes
+    where the check did not look, so it runs instead of being skipped."""
+    add_dist, _ = installed
+    add_dist("langid")
+    assert _skip(fl, command) is True
+    monkeypatch.setenv(variable, value)
+    skip, reason = fl.install_decision(command)
+    assert skip is False and variable in reason
+
+
+@pytest.mark.parametrize("command", [
+    "PIP_TARGET=/other/site pip install langid",
+    "UV_PYTHON=/other/env/bin/python uv pip install langid",
+    "PIP_NO_CACHE_DIR=1 pip install langid",
+    "env PIP_TARGET=/other/site pip install langid",
+    "export PIP_PREFIX=/other; pip install langid",
+    "cd /elsewhere && uv pip install langid",
+    "source /other/env/bin/activate && pip install langid",
+    "conda activate other && pip install langid",
+    "sudo pip install langid",
+    "exec pip install langid",
+    "pip3.12 install langid",
+    "/other/env/bin/pip install langid",
+    "/other/env/bin/python -m pip install langid",
+    "PIP_TARGET=/other/site unsloth install-kernels langid",
+])
+def test_installs_that_may_land_elsewhere_always_run(fl, installed, command):
+    """Only a plain command is trusted to install into this interpreter: inline variables,
+    environment or directory changes, sudo / env / exec, and pip / python by version or
+    another path all run instead of being skipped."""
+    add_dist, _ = installed
+    add_dist("langid")
+    skip, reason = fl.install_decision(command)
+    assert skip is False, reason
+
+
+def test_plain_commands_for_this_interpreter_still_skip(fl, installed):
+    add_dist, _ = installed
+    add_dist("langid")
+    for command in ("pip install langid", "pip3 install langid", "python -m pip install langid",
+                    "python3 -m pip install langid", f"{sys.executable} -m pip install langid",
+                    "uv pip install langid", "mkdir -p out && pip install langid",
+                    "unsloth install-kernels langid"):
+        assert _skip(fl, command) is True, command
+
+
+def test_redirection_variables_that_name_this_environment_still_skip(fl, installed, monkeypatch):
+    add_dist, _ = installed
+    add_dist("langid")
+    for target in (sys.executable, sys.prefix):
+        monkeypatch.setenv("UV_PYTHON", target)
+        assert _skip(fl, "uv pip install langid") is True
+    monkeypatch.setenv("UV_PYTHON", "/other/env/bin/python")
+    assert _skip(fl, "pip install langid") is True  # UV_PYTHON is not read by pip
+    monkeypatch.setenv("PIP_TARGET", "/other/site")
+    monkeypatch.delenv("UV_PYTHON")
+    assert _skip(fl, "uv pip install langid") is True  # nor PIP_* by uv
+
+
+@pytest.mark.parametrize("in_venv, command, system_env, skip", [
+    (True, "uv pip install langid", None, True),
+    (True, "uv pip install --system -qqq langid", None, False),
+    (True, "uv pip install langid", "true", False),
+    # Outside a virtual environment uv takes VIRTUAL_ENV, CONDA_PREFIX or a .venv above
+    # the working directory, or its own system interpreter: never provably this one.
+    (False, "uv pip install langid", None, False),
+    (False, "uv pip install --system -qqq langid", None, False),
+    (False, "uv pip install langid", "true", False),
+])
+def test_uv_installs_skip_only_inside_this_virtual_environment(
+        fl, installed, monkeypatch, in_venv, command, system_env, skip):
+    add_dist, _ = installed
+    add_dist("langid")
+    if system_env:
+        monkeypatch.setenv("UV_SYSTEM_PYTHON", system_env)
+    monkeypatch.setattr(fl, "_in_venv", lambda: in_venv)
+    assert _skip(fl, command) is skip
+
+
+def test_pip_from_outside_a_virtual_environment_still_skips(fl, installed, monkeypatch):
+    """pip is this interpreter's -m pip whatever uv would discover, so VIRTUAL_ENV,
+    CONDA_PREFIX and a .venv do not matter to it."""
+    add_dist, _ = installed
+    add_dist("langid")
+    monkeypatch.setattr(fl, "_in_venv", lambda: False)
+    monkeypatch.setenv("VIRTUAL_ENV", "/other/venv")
+    monkeypatch.setenv("CONDA_PREFIX", "/other/conda")
+    assert _skip(fl, "pip install langid") is True
 
 
 @pytest.mark.parametrize("setting, ran_missing, ran_present", [

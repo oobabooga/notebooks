@@ -7119,6 +7119,8 @@ FSDP2_SINGLE_PROCESS = {
     "NeMo-Gym-Multi-Environment.py": "clones and installs NeMo-Gym through Python subprocess calls",
     # subprocess.Popen(vllm serve ... --port 8000): every rank would bind the same port.
     "Meta-Synthetic-Data-Llama3.1_(8B).py": "starts a vLLM server on fixed port 8000 from Python",
+    # SyntheticDataKit.from_pretrained runs `vllm serve` on port 8000 itself.
+    "Meta_Synthetic_Data_Llama3_2_(3B).py": "starts a vLLM server on fixed port 8000 through SyntheticDataKit",
     # Every rank writes the same <shard>.json.tmp and the second os.replace fails.
     "Synthetic_Data_Hackathon.py": "ranks would write the same temporary shard files",
     # temp_eval_image_{idx}.jpg / temp_output are shared paths that ranks delete.
@@ -7265,7 +7267,17 @@ python "fsdp2_scripts/Qwen3_(4B)-GRPO.py" --dry-run                # print the c
   installed at a version that matches its pin (a `git+` URL counts by its package name),
   or the `apt-get` / ollama program already on `PATH`. Otherwise it runs on one process
   per node while the others wait. Installs into another environment (`--python`,
-  `--target`, `--prefix`, `--root`, or after `uv venv`) always run. Flags such as
+  `--target`, `--prefix`, `--root`, after `uv venv`, `--system` from a virtual
+  environment, or the same set through `PIP_TARGET`, `PIP_PREFIX`, `PIP_ROOT`,
+  `PIP_PYTHON`, `UV_PYTHON` or `UV_SYSTEM_PYTHON`) always run, and so does any install that
+  may land elsewhere: `uv pip` from a Python outside a virtual environment (uv then picks
+  `VIRTUAL_ENV`, `CONDA_PREFIX` or a `.venv`), a command line that sets variables or runs
+  `export`, `cd`, `source`, `sudo`, `env` or `conda`, and a pip or python named by version
+  or another path. Shell steps use the Python
+  that runs the launcher: `python` and `python3` are that Python, `pip` / `pip3` its
+  `-m pip` and `unsloth` its `unsloth` command, whatever is on `PATH`, and from a virtual
+  environment `VIRTUAL_ENV` names it for `uv pip`, so an install goes where the check
+  looked. Flags such as
   `--upgrade` or `--force-reinstall` do not force a run: set
   `UNSLOTH_FSDP2_RUN_INSTALLS=1` for that, or `0` to skip every install. Other shell
   lines (`git clone`, `wget`, `mkdir`) run once per node.
@@ -7280,9 +7292,9 @@ python "fsdp2_scripts/Qwen3_(4B)-GRPO.py" --dry-run                # print the c
   the reason. Their launchers say so in a comment, run the script in one process with a
   note naming the reason, and refuse `--nproc-per-node` above 1 unless
   `UNSLOTH_FSDP2_FORCE=1`. Today that is NeMo-Gym-Sudoku, NeMo-Gym-Multi-Environment,
-  Meta-Synthetic-Data-Llama3.1_(8B), Synthetic_Data_Hackathon,
-  Deepseek_OCR_(3B)-Evaluation, Llama3_(8B)-Ollama, Gemma3N_(2B)-Inference and
-  Oute_TTS_(1B), with their AMD- / Kaggle- variants.
+  Meta-Synthetic-Data-Llama3.1_(8B), Meta_Synthetic_Data_Llama3_2_(3B),
+  Synthetic_Data_Hackathon, Deepseek_OCR_(3B)-Evaluation, Llama3_(8B)-Ollama,
+  Gemma3N_(2B)-Inference and Oute_TTS_(1B), with their AMD- / Kaggle- variants.
 - **Unsloth decides what is supported.** The launcher does not check models, trainers or
   parallel layouts. Unsloth itself refuses layouts it cannot run (for example an invalid
   `UNSLOTH_TP_SIZE`) with an error that names the problem. Nothing in this folder claims
